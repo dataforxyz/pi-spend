@@ -246,11 +246,14 @@ function sessionTokenCacheKey(sessionFile: string, options: ParseSessionTokenOpt
 }
 
 function sessionTokenCacheFile(homeDir = os.homedir()): string {
-	return process.env.PI_FORKS_TOKEN_CACHE_FILE?.trim() || path.join(homeDir, ".local", "state", "pi-forks", "session-token-cache.json");
+	return process.env.PI_SPEND_TOKEN_CACHE_FILE?.trim()
+		|| process.env.PI_FORKS_TOKEN_CACHE_FILE?.trim()
+		|| path.join(homeDir, ".local", "state", "pi-spend", "session-token-cache.json");
 }
 
 function shouldPersistSessionTokenCache(sessionFile: string): boolean {
-	if (process.env.PI_FORKS_TOKEN_CACHE === "0" || process.env.PI_FORKS_TOKEN_CACHE === "false") return false;
+	const cacheFlag = process.env.PI_SPEND_TOKEN_CACHE ?? process.env.PI_FORKS_TOKEN_CACHE;
+	if (cacheFlag === "0" || cacheFlag === "false") return false;
 	const home = path.resolve(os.homedir());
 	const resolved = path.resolve(sessionFile);
 	return resolved === home || resolved.startsWith(`${home}${path.sep}`);

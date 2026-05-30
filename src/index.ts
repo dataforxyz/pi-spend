@@ -1,8 +1,9 @@
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	parseSessionTokenFile,
+	parseSessionTokens,
 	scanAgentSpend,
 	scanForkRuns,
 	scanObservationalMemorySpend,
@@ -23,6 +24,9 @@ let refreshTimer: NodeJS.Timeout | undefined;
 let lastStatus: string | undefined;
 let lastStatusAt = 0;
 let lastScopeKey: string | undefined;
+
+const modelConfigCache = new Map<string, { mtimeMs?: number; size?: number; value?: { provider: string; id: string } }>();
+let memorySpendCache: { length: number; lastEntry?: unknown; value: ObservationalMemorySpendSummary } | undefined;
 
 type SpendSnapshot = {
 	threadTokens?: TokenUsage;
@@ -81,8 +85,14 @@ function scopeKey(scope: SessionScope): string {
 }
 
 function relatedForkSummary(scope: SessionScope): ForkSummary {
-	const scanned = scanForkRuns({ includeCompleted: true, includeTokens: true });
-	return rebuildForkSummary(scanned.runs.filter((run) => runMatchesCurrentSession(run, scope)));
+	const scanned = scanForkRuns({ includeCompleted: true, includeTokens: false });
+	const related = scanned.runs.filter((run) => runMatchesCurrentSession(run, scope));
+	for (const run of related) {
+		const sinceMs = run.startedAt !== undefined ? Math.max(0, run.startedAt - 1_000) : undefined;
+		const tokens = parseSessionTokens(run.sessionDir, sinceMs !== undefined ? { sinceMs } : {});
+		if (tokens) run.tokens = tokens;
+	}
+	return rebuildForkSummary(related);
 }
 
 function currentBranchEntries(ctx: ExtensionContext | undefined): unknown[] {
@@ -113,15 +123,20 @@ function recordValue(value: unknown): Record<string, unknown> | undefined {
 }
 
 function readObservationalMemoryModelConfig(path: string): { provider: string; id: string } | undefined {
-	if (!existsSync(path)) return undefined;
 	try {
+		const stat = statSync(path);
+		const cached = modelConfigCache.get(path);
+		if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.value;
 		const root = recordValue(JSON.parse(readFileSync(path, "utf8")));
 		const settings = recordValue(root?.["observational-memory"]);
 		const model = recordValue(settings?.model) ?? recordValue(settings?.compactionModel);
 		const provider = typeof model?.provider === "string" ? model.provider : undefined;
 		const id = typeof model?.id === "string" ? model.id : undefined;
-		return provider && id ? { provider, id } : undefined;
+		const value = provider && id ? { provider, id } : undefined;
+		modelConfigCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, value });
+		return value;
 	} catch {
+		modelConfigCache.set(path, {});
 		return undefined;
 	}
 }
@@ -149,9 +164,17 @@ function withMemoryInputCost(memorySpend: ObservationalMemorySpendSummary, model
 	};
 }
 
+function cachedMemorySpend(entries: unknown[]): ObservationalMemorySpendSummary {
+	const lastEntry = entries.at(-1);
+	if (memorySpendCache && memorySpendCache.length === entries.length && memorySpendCache.lastEntry === lastEntry) return memorySpendCache.value;
+	const value = scanObservationalMemorySpend(entries);
+	memorySpendCache = { length: entries.length, lastEntry, value };
+	return value;
+}
+
 function currentSpend(ctx?: ExtensionContext): SpendSnapshot {
 	const scope = sessionScope(ctx);
-	const rawMemorySpend = scanObservationalMemorySpend(currentBranchEntries(ctx));
+	const rawMemorySpend = cachedMemorySpend(currentBranchEntries(ctx));
 	const memoryModel = resolveObservationalMemoryModel(ctx);
 	return {
 		threadTokens: parseSessionTokenFile(scope.parentSessionFile),
@@ -209,11 +232,12 @@ function formatSpendReport(ctx?: ExtensionContext): string {
 	return lines.join("\n");
 }
 
-function updateSpendStatus(ctx = latestCtx, now = Date.now()): void {
+function updateSpendStatus(ctx = latestCtx, options: { force?: boolean; now?: number } = {}): void {
 	if (!ctx?.hasUI) return;
+	const now = options.now ?? Date.now();
 	const scope = sessionScope(ctx);
 	const key = scopeKey(scope);
-	if (key !== lastScopeKey || now - lastStatusAt >= REFRESH_MS) {
+	if (options.force || key !== lastScopeKey || now - lastStatusAt >= REFRESH_MS) {
 		lastStatus = buildSpendStatus(currentSpend(ctx));
 		lastStatusAt = now;
 		lastScopeKey = key;
@@ -250,28 +274,28 @@ export const __test = {
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		latestCtx = ctx;
-		updateSpendStatus(ctx, 0);
+		updateSpendStatus(ctx, { force: true });
 		startRefresh();
 	});
 
 	pi.on("turn_end", async (_event, ctx) => {
 		latestCtx = ctx;
-		updateSpendStatus(ctx, 0);
+		updateSpendStatus(ctx, { force: true });
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
 		latestCtx = ctx;
-		updateSpendStatus(ctx, 0);
+		updateSpendStatus(ctx, { force: true });
 	});
 
 	pi.on("model_select", async (_event, ctx) => {
 		latestCtx = ctx;
-		updateSpendStatus(ctx, 0);
+		updateSpendStatus(ctx, { force: true });
 	});
 
 	pi.on("session_compact", async (_event, ctx) => {
 		latestCtx = ctx;
-		updateSpendStatus(ctx, 0);
+		updateSpendStatus(ctx, { force: true });
 	});
 
 	pi.on("session_shutdown", async () => {
@@ -279,21 +303,19 @@ export default function (pi: ExtensionAPI) {
 		latestCtx = undefined;
 	});
 
+	const showSpend = async (_args: string[], ctx: ExtensionContext) => {
+		latestCtx = ctx;
+		ctx.ui.notify(formatSpendReport(ctx), "info");
+		updateSpendStatus(ctx, { force: true });
+	};
+
 	pi.registerCommand("pi-spend", {
 		description: "Show this dialog's token/cost split across dialog, agents, fork handlers, and observational memory.",
-		handler: async (_args, ctx) => {
-			latestCtx = ctx;
-			ctx.ui.notify(formatSpendReport(ctx), "info");
-			updateSpendStatus(ctx, 0);
-		},
+		handler: showSpend,
 	});
 
 	pi.registerCommand("spend", {
 		description: "Alias for /pi-spend.",
-		handler: async (_args, ctx) => {
-			latestCtx = ctx;
-			ctx.ui.notify(formatSpendReport(ctx), "info");
-			updateSpendStatus(ctx, 0);
-		},
+		handler: showSpend,
 	});
 }
