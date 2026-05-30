@@ -1,4 +1,4 @@
-import { readFileSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -10,6 +10,7 @@ import {
 	sumRunTokens,
 	type AgentSpendSummary,
 	type ForkRun,
+	type ForkSource,
 	type ForkSummary,
 	type ObservationalMemorySpendSummary,
 	type TokenUsage,
@@ -18,6 +19,7 @@ import { cyan, formatSpend, formatTokens, green, orange, violet } from "./format
 
 const STATUS_KEY = "pi-spend";
 const REFRESH_MS = 10_000;
+const FORK_SPEND_SOURCES: ForkSource[] = ["intercom", "return_on"];
 
 let latestCtx: ExtensionContext | undefined;
 let refreshTimer: NodeJS.Timeout | undefined;
@@ -55,7 +57,7 @@ function fileInsideDir(file: string | undefined, dir: string | undefined): boole
 
 function runMatchesCurrentSession(run: ForkRun, scope: SessionScope): boolean {
 	if (scope.parentSessionFile && run.parentSessionFile === scope.parentSessionFile) return true;
-	if (scope.parentSessionId && run.parentSessionId === scope.parentSessionId) return true;
+	if (scope.parentSessionId && (run.parentSessionId === scope.parentSessionId || run.parentIntercomTarget === scope.parentSessionId)) return true;
 	if (scope.parentSessionName && (run.parentSessionName === scope.parentSessionName || run.parentIntercomTarget === scope.parentSessionName)) return true;
 	if (fileInsideDir(scope.parentSessionFile, run.sessionDir)) return true;
 	return false;
@@ -85,7 +87,7 @@ function scopeKey(scope: SessionScope): string {
 }
 
 function relatedForkSummary(scope: SessionScope): ForkSummary {
-	const scanned = scanForkRuns({ includeCompleted: true, includeTokens: false });
+	const scanned = scanForkRuns({ includeCompleted: true, includeTokens: false, source: FORK_SPEND_SOURCES });
 	const related = scanned.runs.filter((run) => runMatchesCurrentSession(run, scope));
 	for (const run of related) {
 		const sinceMs = run.startedAt !== undefined ? Math.max(0, run.startedAt - 1_000) : undefined;
@@ -172,14 +174,59 @@ function cachedMemorySpend(entries: unknown[]): ObservationalMemorySpendSummary 
 	return value;
 }
 
-function currentSpend(ctx?: ExtensionContext): SpendSnapshot {
+function tokenFilesUnder(root: string): string[] {
+	const files: string[] = [];
+	const stack = [root];
+	while (stack.length > 0) {
+		const dir = stack.pop() as string;
+		let entries;
+		try {
+			entries = readdirSync(dir, { withFileTypes: true });
+		} catch {
+			continue;
+		}
+		for (const entry of entries) {
+			const fullPath = join(dir, entry.name);
+			if (entry.isDirectory()) stack.push(fullPath);
+			else if (entry.isFile() && entry.name.endsWith(".jsonl")) files.push(fullPath);
+		}
+	}
+	return files;
+}
+
+function allDialogSpend(): TokenUsage | undefined {
+	const tokens = emptyTokens();
+	for (const file of tokenFilesUnder(join(getAgentDir(), "sessions"))) {
+		const spend = parseSessionTokenFile(file);
+		if (!spend) continue;
+		tokens.input += spend.input;
+		tokens.output += spend.output;
+		tokens.total += spend.total;
+		tokens.cost = (tokens.cost ?? 0) + (spend.cost ?? 0);
+	}
+	if (tokens.total <= 0) return undefined;
+	if (!tokens.cost) delete tokens.cost;
+	return tokens;
+}
+
+function allForkSummary(): ForkSummary {
+	const scanned = scanForkRuns({ includeCompleted: true, includeTokens: false, source: FORK_SPEND_SOURCES });
+	for (const run of scanned.runs) {
+		const sinceMs = run.startedAt !== undefined ? Math.max(0, run.startedAt - 1_000) : undefined;
+		const tokens = parseSessionTokens(run.sessionDir, sinceMs !== undefined ? { sinceMs } : {});
+		if (tokens) run.tokens = tokens;
+	}
+	return rebuildForkSummary(scanned.runs);
+}
+
+function currentSpend(ctx?: ExtensionContext, scopeMode: "current" | "all" = "current"): SpendSnapshot {
 	const scope = sessionScope(ctx);
 	const rawMemorySpend = cachedMemorySpend(currentBranchEntries(ctx));
 	const memoryModel = resolveObservationalMemoryModel(ctx);
 	return {
-		threadTokens: parseSessionTokenFile(scope.parentSessionFile),
-		agentSpend: scanAgentSpend({ parentSessionFile: scope.parentSessionFile }),
-		forkSummary: relatedForkSummary(scope),
+		threadTokens: scopeMode === "all" ? allDialogSpend() : parseSessionTokenFile(scope.parentSessionFile),
+		agentSpend: scopeMode === "all" ? scanAgentSpend() : scanAgentSpend(scope),
+		forkSummary: scopeMode === "all" ? allForkSummary() : relatedForkSummary(scope),
 		memorySpend: withMemoryInputCost(rawMemorySpend, memoryModel),
 		memoryPricingModel: modelInputCostPerMillion(memoryModel) ? modelDisplayName(memoryModel) : undefined,
 	};
@@ -215,20 +262,21 @@ function formatSpendLine(label: string, tokens: TokenUsage | undefined, extra?: 
 	return `${label}: ${spend}${extra ? ` · ${extra}` : ""}`;
 }
 
-function formatMemorySpendLine(memory: ObservationalMemorySpendSummary, pricingModel?: string): string {
+function formatMemorySpendLine(memory: ObservationalMemorySpendSummary, pricingModel?: string, scopeLabel?: string): string {
 	const visible = formatSpend(memory.visibleTokens) ?? "0 tok";
 	const full = formatSpend(memory.fullTokens) ?? "0 tok";
 	const pricedAs = pricingModel ? ` · priced as ${pricingModel} input` : "";
-	return `memory: ${visible} visible context · ${full} full active (${memory.visibleObservations} obs/${memory.visibleReflections} refl visible · ${memory.fullObservations} obs/${memory.fullReflections} refl active${memory.droppedObservations ? ` · ${memory.droppedObservations} dropped` : ""}${pricedAs})`;
+	return `memory${scopeLabel ? ` (${scopeLabel})` : ""}: ${visible} visible context · ${full} full active (${memory.visibleObservations} obs/${memory.visibleReflections} refl visible · ${memory.fullObservations} obs/${memory.fullReflections} refl active${memory.droppedObservations ? ` · ${memory.droppedObservations} dropped` : ""}${pricedAs})`;
 }
 
-function formatSpendReport(ctx?: ExtensionContext): string {
-	const spend = currentSpend(ctx);
-	const lines = ["Pi spend for this dialog"];
+function formatSpendReport(ctx?: ExtensionContext, scopeMode: "current" | "all" = "current"): string {
+	const spend = currentSpend(ctx, scopeMode);
+	const lines = [scopeMode === "all" ? "Pi spend (all known)" : "Pi spend for this dialog"];
 	lines.push(formatSpendLine("dialog", spend.threadTokens));
 	lines.push(formatSpendLine("agents", spend.agentSpend.totalTokens, `${spend.agentSpend.runs.length} runs · ${spend.agentSpend.steps} steps${spend.agentSpend.active.length ? ` · ${spend.agentSpend.active.length} active` : ""}`));
-	lines.push(formatSpendLine("forks", spend.forkSummary.totalTokens, `${spend.forkSummary.runs.length} related runs${spend.forkSummary.running.length || spend.forkSummary.stale.length ? ` · ${spend.forkSummary.running.length} running · ${spend.forkSummary.stale.length} stale` : ""}`));
-	lines.push(formatMemorySpendLine(spend.memorySpend, spend.memoryPricingModel));
+	const forkScope = scopeMode === "all" ? "runs" : "related runs";
+	lines.push(formatSpendLine("forks", spend.forkSummary.totalTokens, `${spend.forkSummary.runs.length} ${forkScope}${spend.forkSummary.running.length || spend.forkSummary.stale.length ? ` · ${spend.forkSummary.running.length} running · ${spend.forkSummary.stale.length} stale` : ""}`));
+	lines.push(formatMemorySpendLine(spend.memorySpend, spend.memoryPricingModel, scopeMode === "all" ? "current branch" : undefined));
 	return lines.join("\n");
 }
 
@@ -303,19 +351,25 @@ export default function (pi: ExtensionAPI) {
 		latestCtx = undefined;
 	});
 
-	const showSpend = async (_args: string[], ctx: ExtensionContext) => {
+	const showSpend = async (args: string[], ctx: ExtensionContext) => {
 		latestCtx = ctx;
-		ctx.ui.notify(formatSpendReport(ctx), "info");
+		const scopeMode = args.some((arg) => arg === "all" || arg === "--all" || arg === "-a") ? "all" : "current";
+		ctx.ui.notify(formatSpendReport(ctx, scopeMode), "info");
 		updateSpendStatus(ctx, { force: true });
 	};
 
 	pi.registerCommand("pi-spend", {
-		description: "Show this dialog's token/cost split across dialog, agents, fork handlers, and observational memory.",
+		description: "Show token/cost split across dialog, agents, fork handlers, and observational memory. Use --all for all known spend.",
 		handler: showSpend,
 	});
 
 	pi.registerCommand("spend", {
 		description: "Alias for /pi-spend.",
 		handler: showSpend,
+	});
+
+	pi.registerCommand("pi-spend-all", {
+		description: "Show all known token/cost spend by category.",
+		handler: async (_args, ctx) => showSpend(["--all"], ctx),
 	});
 }

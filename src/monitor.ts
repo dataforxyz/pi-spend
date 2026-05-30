@@ -139,7 +139,10 @@ export interface ObservationalMemorySpendSummary {
 
 export interface AgentSpendOptions {
 	parentSessionFile?: string;
+	parentSessionId?: string;
+	parentSessionName?: string;
 	rootDir?: string;
+	homeDir?: string;
 }
 
 interface IntercomHandlersState {
@@ -731,14 +734,14 @@ function stepTokens(step: Record<string, unknown>): TokenUsage {
 	return tokensFromAttempts(step.modelAttempts);
 }
 
-export function scanAgentSpend(options: AgentSpendOptions = {}): AgentSpendSummary {
+function legacyAgentSpendRuns(options: AgentSpendOptions): AgentSpendRun[] {
 	const parentSessionFile = options.parentSessionFile;
 	const rootDir = options.rootDir ?? defaultAgentRoot();
 	let entries: fs.Dirent[];
 	try {
 		entries = fs.readdirSync(rootDir, { withFileTypes: true });
 	} catch {
-		return { runs: [], active: [], steps: 0, totalTokens: { input: 0, output: 0, total: 0 } };
+		return [];
 	}
 	const runs: AgentSpendRun[] = [];
 	for (const entry of entries) {
@@ -764,6 +767,44 @@ export function scanAgentSpend(options: AgentSpendOptions = {}): AgentSpendSumma
 			...(numberValue(status.endedAt) ? { endedAt: numberValue(status.endedAt) } : {}),
 		});
 	}
+	return runs;
+}
+
+function subagentHandlerMatchesParent(handler: Record<string, unknown>, options: AgentSpendOptions): boolean {
+	if (options.parentSessionFile && stringValue(handler.parentSessionFile) !== options.parentSessionFile) return false;
+	if (options.parentSessionId && stringValue(handler.parentSessionId) !== options.parentSessionId && stringValue(handler.parentIntercomTarget) !== options.parentSessionId) return false;
+	if (options.parentSessionName && stringValue(handler.parentSessionName) !== options.parentSessionName && stringValue(handler.parentIntercomTarget) !== options.parentSessionName) return false;
+	return true;
+}
+
+function subagentHandlerSpendRuns(options: AgentSpendOptions): AgentSpendRun[] {
+	const state = readJsonFile<SubagentHandlersState>(getForkHandlersFile("subagents", options.homeDir ?? os.homedir()));
+	const runs: AgentSpendRun[] = [];
+	for (const handler of state?.handlers ?? []) {
+		if (!subagentHandlerMatchesParent(handler, options)) continue;
+		const sessionDir = stringValue(handler.sessionDir);
+		const startedAt = numberValue(handler.startedAt);
+		const sinceMs = startedAt !== undefined ? Math.max(0, startedAt - 1_000) : undefined;
+		const tokens = parseSessionTokens(sessionDir, sinceMs !== undefined ? { sinceMs } : {}) ?? emptyTokens();
+		const status = statusValue(handler.status);
+		const active = status === "running" || status === "starting";
+		runs.push({
+			id: stringValue(handler.id) ?? stringValue(handler.runId) ?? "subagent",
+			state: status,
+			steps: tokens.total > 0 ? 1 : 0,
+			active,
+			tokens,
+			...(tokens.cost ? { cost: tokens.cost } : {}),
+			...(stringValue(handler.cwd) ? { cwd: stringValue(handler.cwd) } : {}),
+			...(startedAt !== undefined ? { startedAt } : {}),
+			...(numberValue(handler.endedAt) !== undefined ? { endedAt: numberValue(handler.endedAt) } : {}),
+		});
+	}
+	return runs;
+}
+
+export function scanAgentSpend(options: AgentSpendOptions = {}): AgentSpendSummary {
+	const runs = [...legacyAgentSpendRuns(options), ...subagentHandlerSpendRuns(options)];
 	const totalTokens = sumRunTokens(runs);
 	const totalCost = totalTokens.cost;
 	return {

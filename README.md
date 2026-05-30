@@ -15,8 +15,8 @@ Example:
 Segments:
 
 - `◉ dialog` — the current session JSONL token/cost usage.
-- `◆ agents` — async subagent run token/cost totals for this dialog.
-- `↯ forks` — related background fork-handler token/cost totals.
+- `◆ agents` — subagent token/cost totals for this dialog, including modern `pi-subagents` background handler sessions and legacy async run status files.
+- `↯ forks` — related non-agent background fork-handler token/cost totals (`pi-intercom` and `pi-return-on`).
 - `✦ mem` — observational-memory footprint.
   - `ctx` is the currently visible compaction-context memory.
   - `full` is the full active observational-memory ledger when larger.
@@ -27,8 +27,10 @@ The dialog, agent, and fork dollar amounts come from recorded provider/Pi usage 
 ## Commands
 
 ```text
-/pi-spend    show the dialog/agent/fork/memory token and cost split
-/spend       alias for /pi-spend
+/pi-spend        show this dialog's dialog/agent/fork/memory token and cost split
+/pi-spend --all  show all known spend by category: all session JSONL dialog usage, all subagents, all non-agent forks, and current-branch memory
+/pi-spend-all    alias for /pi-spend --all
+/spend           alias for /pi-spend
 ```
 
 ## Install
