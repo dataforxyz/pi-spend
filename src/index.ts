@@ -476,9 +476,14 @@ export default function (pi: ExtensionAPI) {
 		latestCtx = undefined;
 	});
 
-	const showSpend = async (args: string[], ctx: ExtensionContext) => {
+	const showSpend = async (args: unknown, ctx: ExtensionContext) => {
 		latestCtx = ctx;
-		const scopeMode = args.some((arg) => arg === "all" || arg === "--all" || arg === "-a") ? "all" : "current";
+		const argv = Array.isArray(args)
+			? args.map(String)
+			: typeof args === "string"
+				? args.trim().split(/\s+/).filter(Boolean)
+				: [];
+		const scopeMode = argv.some((arg) => arg === "all" || arg === "--all" || arg === "-a") ? "all" : "current";
 		if (scopeMode === "all") {
 			await setBusyStatus(ctx, "spend all: starting scan");
 			const report = await formatAllSpendReport(ctx, (message) => setBusyStatus(ctx, message));
