@@ -1,4 +1,5 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
+import { readdir as readdirAsync } from "node:fs/promises";
 import { join } from "node:path";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -8,6 +9,7 @@ import {
 	scanForkRuns,
 	scanObservationalMemorySpend,
 	sumRunTokens,
+	type AgentSpendRun,
 	type AgentSpendSummary,
 	type ForkRun,
 	type ForkSource,
@@ -19,6 +21,7 @@ import { cyan, formatSpend, formatTokens, green, orange, violet } from "./format
 
 const STATUS_KEY = "pi-spend";
 const REFRESH_MS = 10_000;
+const ALL_REPORT_CACHE_MS = 60_000;
 const FORK_SPEND_SOURCES: ForkSource[] = ["intercom", "return_on"];
 
 let latestCtx: ExtensionContext | undefined;
@@ -26,6 +29,7 @@ let refreshTimer: NodeJS.Timeout | undefined;
 let lastStatus: string | undefined;
 let lastStatusAt = 0;
 let lastScopeKey: string | undefined;
+let allReportCache: { createdAt: number; report: string } | undefined;
 
 const modelConfigCache = new Map<string, { mtimeMs?: number; size?: number; value?: { provider: string; id: string } }>();
 let memorySpendCache: { length: number; lastEntry?: unknown; value: ObservationalMemorySpendSummary } | undefined;
@@ -47,6 +51,20 @@ type SessionScope = {
 
 function emptyTokens(): TokenUsage {
 	return { input: 0, output: 0, total: 0 };
+}
+
+function addTokenUsage(acc: TokenUsage, tokens: TokenUsage | undefined): void {
+	if (!tokens) return;
+	acc.input += tokens.input;
+	acc.output += tokens.output;
+	acc.total += tokens.total;
+	acc.cost = (acc.cost ?? 0) + (tokens.cost ?? 0);
+}
+
+function finalizeTokenUsage(tokens: TokenUsage): TokenUsage | undefined {
+	if (tokens.total <= 0) return undefined;
+	if (!tokens.cost) delete tokens.cost;
+	return tokens;
 }
 
 function fileInsideDir(file: string | undefined, dir: string | undefined): boolean {
@@ -174,6 +192,20 @@ function cachedMemorySpend(entries: unknown[]): ObservationalMemorySpendSummary 
 	return value;
 }
 
+type ProgressUpdater = (message: string) => Promise<void>;
+
+function nextTick(): Promise<void> {
+	return new Promise((resolve) => setImmediate(resolve));
+}
+
+async function setBusyStatus(ctx: ExtensionContext | undefined, message: string): Promise<void> {
+	if (ctx?.hasUI) {
+		ctx.ui.setStatus(STATUS_KEY, orange(`⧗ ${message}`));
+		ctx.ui.requestRender?.();
+	}
+	await nextTick();
+}
+
 function tokenFilesUnder(root: string): string[] {
 	const files: string[] = [];
 	const stack = [root];
@@ -196,17 +228,39 @@ function tokenFilesUnder(root: string): string[] {
 
 function allDialogSpend(): TokenUsage | undefined {
 	const tokens = emptyTokens();
-	for (const file of tokenFilesUnder(join(getAgentDir(), "sessions"))) {
-		const spend = parseSessionTokenFile(file);
-		if (!spend) continue;
-		tokens.input += spend.input;
-		tokens.output += spend.output;
-		tokens.total += spend.total;
-		tokens.cost = (tokens.cost ?? 0) + (spend.cost ?? 0);
+	for (const file of tokenFilesUnder(join(getAgentDir(), "sessions"))) addTokenUsage(tokens, parseSessionTokenFile(file));
+	return finalizeTokenUsage(tokens);
+}
+
+async function tokenFilesUnderAsync(root: string, progress?: ProgressUpdater): Promise<string[]> {
+	const files: string[] = [];
+	const stack = [root];
+	while (stack.length > 0) {
+		const dir = stack.pop() as string;
+		let entries;
+		try {
+			entries = await readdirAsync(dir, { withFileTypes: true });
+		} catch {
+			continue;
+		}
+		for (const entry of entries) {
+			const fullPath = join(dir, entry.name);
+			if (entry.isDirectory()) stack.push(fullPath);
+			else if (entry.isFile() && entry.name.endsWith(".jsonl")) files.push(fullPath);
+		}
+		if (files.length > 0 && files.length % 250 === 0) await progress?.(`spend all: found ${files.length} session files`);
 	}
-	if (tokens.total <= 0) return undefined;
-	if (!tokens.cost) delete tokens.cost;
-	return tokens;
+	return files;
+}
+
+async function allDialogSpendAsync(progress?: ProgressUpdater): Promise<TokenUsage | undefined> {
+	const files = await tokenFilesUnderAsync(join(getAgentDir(), "sessions"), progress);
+	const tokens = emptyTokens();
+	for (let index = 0; index < files.length; index++) {
+		addTokenUsage(tokens, parseSessionTokenFile(files[index]));
+		if (index % 25 === 0) await progress?.(`spend all: dialog ${index + 1}/${files.length}`);
+	}
+	return finalizeTokenUsage(tokens);
 }
 
 function allForkSummary(): ForkSummary {
@@ -215,6 +269,52 @@ function allForkSummary(): ForkSummary {
 		const sinceMs = run.startedAt !== undefined ? Math.max(0, run.startedAt - 1_000) : undefined;
 		const tokens = parseSessionTokens(run.sessionDir, sinceMs !== undefined ? { sinceMs } : {});
 		if (tokens) run.tokens = tokens;
+	}
+	return rebuildForkSummary(scanned.runs);
+}
+
+function agentSummaryFromRuns(runs: AgentSpendRun[]): AgentSpendSummary {
+	const totalTokens = sumRunTokens(runs);
+	return {
+		runs,
+		active: runs.filter((run) => run.active),
+		steps: runs.reduce((sum, run) => sum + run.steps, 0),
+		totalTokens,
+		...(totalTokens.cost ? { totalCost: totalTokens.cost } : {}),
+	};
+}
+
+async function allAgentSpendAsync(progress?: ProgressUpdater): Promise<AgentSpendSummary> {
+	const scanned = scanForkRuns({ includeCompleted: true, includeTokens: false, source: "subagents" });
+	const runs: AgentSpendRun[] = [];
+	for (let index = 0; index < scanned.runs.length; index++) {
+		const run = scanned.runs[index];
+		const sinceMs = run.startedAt !== undefined ? Math.max(0, run.startedAt - 1_000) : undefined;
+		const tokens = parseSessionTokens(run.sessionDir, sinceMs !== undefined ? { sinceMs } : {}) ?? emptyTokens();
+		runs.push({
+			id: run.id,
+			state: run.status,
+			steps: tokens.total > 0 ? 1 : 0,
+			active: run.status === "running" || run.status === "starting",
+			tokens,
+			...(tokens.cost ? { cost: tokens.cost } : {}),
+			...(run.cwd ? { cwd: run.cwd } : {}),
+			...(run.startedAt !== undefined ? { startedAt: run.startedAt } : {}),
+			...(run.endedAt !== undefined ? { endedAt: run.endedAt } : {}),
+		});
+		if (index % 25 === 0) await progress?.(`spend all: agents ${index + 1}/${scanned.runs.length}`);
+	}
+	return agentSummaryFromRuns(runs);
+}
+
+async function allForkSummaryAsync(progress?: ProgressUpdater): Promise<ForkSummary> {
+	const scanned = scanForkRuns({ includeCompleted: true, includeTokens: false, source: FORK_SPEND_SOURCES });
+	for (let index = 0; index < scanned.runs.length; index++) {
+		const run = scanned.runs[index];
+		const sinceMs = run.startedAt !== undefined ? Math.max(0, run.startedAt - 1_000) : undefined;
+		const tokens = parseSessionTokens(run.sessionDir, sinceMs !== undefined ? { sinceMs } : {});
+		if (tokens) run.tokens = tokens;
+		if (index % 25 === 0) await progress?.(`spend all: forks ${index + 1}/${scanned.runs.length}`);
 	}
 	return rebuildForkSummary(scanned.runs);
 }
@@ -269,8 +369,7 @@ function formatMemorySpendLine(memory: ObservationalMemorySpendSummary, pricingM
 	return `memory${scopeLabel ? ` (${scopeLabel})` : ""}: ${visible} visible context · ${full} full active (${memory.visibleObservations} obs/${memory.visibleReflections} refl visible · ${memory.fullObservations} obs/${memory.fullReflections} refl active${memory.droppedObservations ? ` · ${memory.droppedObservations} dropped` : ""}${pricedAs})`;
 }
 
-function formatSpendReport(ctx?: ExtensionContext, scopeMode: "current" | "all" = "current"): string {
-	const spend = currentSpend(ctx, scopeMode);
+function formatSpendSnapshot(spend: SpendSnapshot, scopeMode: "current" | "all"): string {
 	const lines = [scopeMode === "all" ? "Pi spend (all known)" : "Pi spend for this dialog"];
 	lines.push(formatSpendLine("dialog", spend.threadTokens));
 	lines.push(formatSpendLine("agents", spend.agentSpend.totalTokens, `${spend.agentSpend.runs.length} runs · ${spend.agentSpend.steps} steps${spend.agentSpend.active.length ? ` · ${spend.agentSpend.active.length} active` : ""}`));
@@ -278,6 +377,32 @@ function formatSpendReport(ctx?: ExtensionContext, scopeMode: "current" | "all" 
 	lines.push(formatSpendLine("forks", spend.forkSummary.totalTokens, `${spend.forkSummary.runs.length} ${forkScope}${spend.forkSummary.running.length || spend.forkSummary.stale.length ? ` · ${spend.forkSummary.running.length} running · ${spend.forkSummary.stale.length} stale` : ""}`));
 	lines.push(formatMemorySpendLine(spend.memorySpend, spend.memoryPricingModel, scopeMode === "all" ? "current branch" : undefined));
 	return lines.join("\n");
+}
+
+function formatSpendReport(ctx?: ExtensionContext, scopeMode: "current" | "all" = "current"): string {
+	return formatSpendSnapshot(currentSpend(ctx, scopeMode), scopeMode);
+}
+
+async function formatAllSpendReport(ctx: ExtensionContext, progress?: ProgressUpdater): Promise<string> {
+	const cached = allReportCache;
+	if (cached && Date.now() - cached.createdAt < ALL_REPORT_CACHE_MS) return `${cached.report}\n(cache: reused ${Math.ceil((Date.now() - cached.createdAt) / 1000)}s-old all-spend scan)`;
+	await progress?.("spend all: scanning dialog sessions");
+	const threadTokens = await allDialogSpendAsync(progress);
+	await progress?.("spend all: scanning subagents");
+	const agentSpend = await allAgentSpendAsync(progress);
+	await progress?.("spend all: scanning fork handlers");
+	const forkSummary = await allForkSummaryAsync(progress);
+	const memoryModel = resolveObservationalMemoryModel(ctx);
+	const spend: SpendSnapshot = {
+		threadTokens,
+		agentSpend,
+		forkSummary,
+		memorySpend: withMemoryInputCost(cachedMemorySpend(currentBranchEntries(ctx)), memoryModel),
+		memoryPricingModel: modelInputCostPerMillion(memoryModel) ? modelDisplayName(memoryModel) : undefined,
+	};
+	const report = formatSpendSnapshot(spend, "all");
+	allReportCache = { createdAt: Date.now(), report };
+	return report;
 }
 
 function updateSpendStatus(ctx = latestCtx, options: { force?: boolean; now?: number } = {}): void {
@@ -354,7 +479,14 @@ export default function (pi: ExtensionAPI) {
 	const showSpend = async (args: string[], ctx: ExtensionContext) => {
 		latestCtx = ctx;
 		const scopeMode = args.some((arg) => arg === "all" || arg === "--all" || arg === "-a") ? "all" : "current";
-		ctx.ui.notify(formatSpendReport(ctx, scopeMode), "info");
+		if (scopeMode === "all") {
+			await setBusyStatus(ctx, "spend all: starting scan");
+			const report = await formatAllSpendReport(ctx, (message) => setBusyStatus(ctx, message));
+			ctx.ui.notify(report, "info");
+			updateSpendStatus(ctx, { force: true });
+			return;
+		}
+		ctx.ui.notify(formatSpendReport(ctx), "info");
 		updateSpendStatus(ctx, { force: true });
 	};
 

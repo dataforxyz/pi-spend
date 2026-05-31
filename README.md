@@ -22,7 +22,7 @@ Segments:
   - `full` is the full active observational-memory ledger when larger.
   - memory dollars are estimated as input-context cost using the configured observational-memory model (`observational-memory.model` or legacy `observational-memory.compactionModel`), falling back to the current session model.
 
-The dialog, agent, and fork dollar amounts come from recorded provider/Pi usage when available, so they reflect the model used by those calls.
+The dialog, agent, and fork dollar amounts come from recorded provider/Pi usage when available, so they reflect the model used by those calls. Expensive all-spend scans show a temporary footer progress indicator and reuse a short-lived in-memory report cache; individual JSONL token parses are cached by file size/mtime on disk.
 
 ## Commands
 
