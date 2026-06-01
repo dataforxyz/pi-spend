@@ -41,4 +41,8 @@ test("scanAgentSpend includes pi-subagents fork-handler session spend", () => {
 	const spendBySessionId = scanAgentSpend({ homeDir: home, rootDir: path.join(home, "missing-legacy"), parentSessionId: "session-id" });
 	assert.equal(spendBySessionId.runs.length, 1);
 	assert.equal(spendBySessionId.totalTokens.total, 140);
+
+	const spendByAnyParentId = scanAgentSpend({ homeDir: home, rootDir: path.join(home, "missing-legacy"), parentSessionFile, parentSessionId: "different-id" });
+	assert.equal(spendByAnyParentId.runs.length, 1);
+	assert.equal(spendByAnyParentId.totalTokens.total, 140);
 });

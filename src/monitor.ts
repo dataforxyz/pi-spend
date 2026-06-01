@@ -771,10 +771,12 @@ function legacyAgentSpendRuns(options: AgentSpendOptions): AgentSpendRun[] {
 }
 
 function subagentHandlerMatchesParent(handler: Record<string, unknown>, options: AgentSpendOptions): boolean {
-	if (options.parentSessionFile && stringValue(handler.parentSessionFile) !== options.parentSessionFile) return false;
-	if (options.parentSessionId && stringValue(handler.parentSessionId) !== options.parentSessionId && stringValue(handler.parentIntercomTarget) !== options.parentSessionId) return false;
-	if (options.parentSessionName && stringValue(handler.parentSessionName) !== options.parentSessionName && stringValue(handler.parentIntercomTarget) !== options.parentSessionName) return false;
-	return true;
+	const hasParentFilter = !!(options.parentSessionFile || options.parentSessionId || options.parentSessionName);
+	if (!hasParentFilter) return true;
+	if (options.parentSessionFile && stringValue(handler.parentSessionFile) === options.parentSessionFile) return true;
+	if (options.parentSessionId && (stringValue(handler.parentSessionId) === options.parentSessionId || stringValue(handler.parentIntercomTarget) === options.parentSessionId)) return true;
+	if (options.parentSessionName && (stringValue(handler.parentSessionName) === options.parentSessionName || stringValue(handler.parentIntercomTarget) === options.parentSessionName)) return true;
+	return false;
 }
 
 function subagentHandlerSpendRuns(options: AgentSpendOptions): AgentSpendRun[] {
