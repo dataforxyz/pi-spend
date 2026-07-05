@@ -14,6 +14,7 @@ test("spend status labels memory context and full footprint", () => {
 		threadTokens: { input: 1_000, output: 200, total: 1_200, cost: 0.01 },
 		agentSpend: { runs: [], active: [], steps: 0, totalTokens: { input: 0, output: 0, total: 0 } },
 		forkSummary: { runs: [], running: [], stale: [], countsByStatus: { starting: 0, running: 0, complete: 0, failed: 0, stale: 0, unknown: 0 }, totalTokens: { input: 0, output: 0, total: 0 }, maxRunningDurationMs: 0 },
+		forkSpendEnabled: true,
 		memorySpend: {
 			visibleTokens: { input: 33_000, output: 0, total: 33_000, cost: 0.165 },
 			fullTokens: { input: 35_000, output: 0, total: 35_000, cost: 0.175 },

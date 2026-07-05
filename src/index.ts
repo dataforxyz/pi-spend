@@ -18,6 +18,7 @@ import {
 	type TokenUsage,
 } from "./monitor.ts";
 import { cyan, formatSpend, formatTokens, green, orange, violet } from "./formatting.ts";
+import { isPiForksExtensionEnabledFromSettings } from "./pi-forks-detection.ts";
 
 const STATUS_KEY = "pi-spend";
 const REFRESH_MS = 10_000;
@@ -29,7 +30,7 @@ let refreshTimer: NodeJS.Timeout | undefined;
 let lastStatus: string | undefined;
 let lastStatusAt = 0;
 let lastScopeKey: string | undefined;
-let allReportCache: { createdAt: number; report: string } | undefined;
+let allReportCache: { createdAt: number; report: string; forkSpendEnabled: boolean } | undefined;
 
 const modelConfigCache = new Map<string, { mtimeMs?: number; size?: number; value?: { provider: string; id: string } }>();
 let memorySpendCache: { length: number; lastEntry?: unknown; value: ObservationalMemorySpendSummary } | undefined;
@@ -38,6 +39,7 @@ type SpendSnapshot = {
 	threadTokens?: TokenUsage;
 	agentSpend: AgentSpendSummary;
 	forkSummary: ForkSummary;
+	forkSpendEnabled: boolean;
 	memorySpend: ObservationalMemorySpendSummary;
 	memoryPricingModel?: string;
 };
@@ -59,6 +61,17 @@ function addTokenUsage(acc: TokenUsage, tokens: TokenUsage | undefined): void {
 	acc.output += tokens.output;
 	acc.total += tokens.total;
 	acc.cost = (acc.cost ?? 0) + (tokens.cost ?? 0);
+}
+
+function emptyForkSummary(): ForkSummary {
+	return {
+		runs: [],
+		running: [],
+		stale: [],
+		countsByStatus: { starting: 0, running: 0, complete: 0, failed: 0, stale: 0, unknown: 0 },
+		totalTokens: emptyTokens(),
+		maxRunningDurationMs: 0,
+	};
 }
 
 function finalizeTokenUsage(tokens: TokenUsage): TokenUsage | undefined {
@@ -319,14 +332,20 @@ async function allForkSummaryAsync(progress?: ProgressUpdater): Promise<ForkSumm
 	return rebuildForkSummary(scanned.runs);
 }
 
+function forkSpendEnabled(ctx?: ExtensionContext): boolean {
+	return isPiForksExtensionEnabledFromSettings({ cwd: ctx?.cwd });
+}
+
 function currentSpend(ctx?: ExtensionContext, scopeMode: "current" | "all" = "current"): SpendSnapshot {
 	const scope = sessionScope(ctx);
 	const rawMemorySpend = cachedMemorySpend(currentBranchEntries(ctx));
 	const memoryModel = resolveObservationalMemoryModel(ctx);
+	const forksEnabled = forkSpendEnabled(ctx);
 	return {
 		threadTokens: scopeMode === "all" ? allDialogSpend() : parseSessionTokenFile(scope.parentSessionFile),
 		agentSpend: scopeMode === "all" ? scanAgentSpend() : scanAgentSpend(scope),
-		forkSummary: scopeMode === "all" ? allForkSummary() : relatedForkSummary(scope),
+		forkSummary: forksEnabled ? (scopeMode === "all" ? allForkSummary() : relatedForkSummary(scope)) : emptyForkSummary(),
+		forkSpendEnabled: forksEnabled,
 		memorySpend: withMemoryInputCost(rawMemorySpend, memoryModel),
 		memoryPricingModel: modelInputCostPerMillion(memoryModel) ? modelDisplayName(memoryModel) : undefined,
 	};
@@ -341,7 +360,7 @@ function buildSpendStatus(spend: SpendSnapshot): string | undefined {
 		const active = spend.agentSpend.active.length > 0 ? ` (${spend.agentSpend.active.length} active)` : "";
 		parts.push(violet(`◆ agents ${agents}${active}`));
 	}
-	const forks = formatSpend(spend.forkSummary.totalTokens);
+	const forks = spend.forkSpendEnabled ? formatSpend(spend.forkSummary.totalTokens) : undefined;
 	if (forks) {
 		const runCount = spend.forkSummary.runs.filter((run) => (run.tokens?.total ?? 0) > 0).length;
 		const runLabel = runCount === 1 ? "fork" : "forks";
@@ -374,7 +393,9 @@ function formatSpendSnapshot(spend: SpendSnapshot, scopeMode: "current" | "all")
 	lines.push(formatSpendLine("dialog", spend.threadTokens));
 	lines.push(formatSpendLine("agents", spend.agentSpend.totalTokens, `${spend.agentSpend.runs.length} runs · ${spend.agentSpend.steps} steps${spend.agentSpend.active.length ? ` · ${spend.agentSpend.active.length} active` : ""}`));
 	const forkScope = scopeMode === "all" ? "runs" : "related runs";
-	lines.push(formatSpendLine("forks", spend.forkSummary.totalTokens, `${spend.forkSummary.runs.length} ${forkScope}${spend.forkSummary.running.length || spend.forkSummary.stale.length ? ` · ${spend.forkSummary.running.length} running · ${spend.forkSummary.stale.length} stale` : ""}`));
+	lines.push(spend.forkSpendEnabled
+		? formatSpendLine("forks", spend.forkSummary.totalTokens, `${spend.forkSummary.runs.length} ${forkScope}${spend.forkSummary.running.length || spend.forkSummary.stale.length ? ` · ${spend.forkSummary.running.length} running · ${spend.forkSummary.stale.length} stale` : ""}`)
+		: "forks: disabled (pi-forks not enabled)");
 	lines.push(formatMemorySpendLine(spend.memorySpend, spend.memoryPricingModel, scopeMode === "all" ? "current branch" : undefined));
 	return lines.join("\n");
 }
@@ -384,24 +405,29 @@ function formatSpendReport(ctx?: ExtensionContext, scopeMode: "current" | "all" 
 }
 
 async function formatAllSpendReport(ctx: ExtensionContext, progress?: ProgressUpdater): Promise<string> {
+	const forksEnabled = forkSpendEnabled(ctx);
 	const cached = allReportCache;
-	if (cached && Date.now() - cached.createdAt < ALL_REPORT_CACHE_MS) return `${cached.report}\n(cache: reused ${Math.ceil((Date.now() - cached.createdAt) / 1000)}s-old all-spend scan)`;
+	if (cached && cached.forkSpendEnabled === forksEnabled && Date.now() - cached.createdAt < ALL_REPORT_CACHE_MS) return `${cached.report}\n(cache: reused ${Math.ceil((Date.now() - cached.createdAt) / 1000)}s-old all-spend scan)`;
 	await progress?.("spend all: scanning dialog sessions");
 	const threadTokens = await allDialogSpendAsync(progress);
 	await progress?.("spend all: scanning subagents");
 	const agentSpend = await allAgentSpendAsync(progress);
-	await progress?.("spend all: scanning fork handlers");
-	const forkSummary = await allForkSummaryAsync(progress);
+	let forkSummary = emptyForkSummary();
+	if (forksEnabled) {
+		await progress?.("spend all: scanning fork handlers");
+		forkSummary = await allForkSummaryAsync(progress);
+	}
 	const memoryModel = resolveObservationalMemoryModel(ctx);
 	const spend: SpendSnapshot = {
 		threadTokens,
 		agentSpend,
 		forkSummary,
+		forkSpendEnabled: forksEnabled,
 		memorySpend: withMemoryInputCost(cachedMemorySpend(currentBranchEntries(ctx)), memoryModel),
 		memoryPricingModel: modelInputCostPerMillion(memoryModel) ? modelDisplayName(memoryModel) : undefined,
 	};
 	const report = formatSpendSnapshot(spend, "all");
-	allReportCache = { createdAt: Date.now(), report };
+	allReportCache = { createdAt: Date.now(), report, forkSpendEnabled: forksEnabled };
 	return report;
 }
 
@@ -441,6 +467,7 @@ function stopRefresh(ctx = latestCtx): void {
 export const __test = {
 	buildSpendStatus,
 	formatSpendReport,
+	isPiForksExtensionEnabledFromSettings,
 	readObservationalMemoryModelConfig,
 };
 
