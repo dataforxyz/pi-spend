@@ -1,7 +1,8 @@
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { readdir as readdirAsync } from "node:fs/promises";
 import { join } from "node:path";
-import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, getSettingsListTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Container, matchesKey, type SettingItem, SettingsList, truncateToWidth } from "@earendil-works/pi-tui";
 import {
 	parseSessionTokenFile,
 	parseSessionTokens,
@@ -24,10 +25,33 @@ const STATUS_KEY = "pi-spend";
 const REFRESH_MS = 10_000;
 const ALL_REPORT_CACHE_MS = 60_000;
 const FORK_SPEND_SOURCES: ForkSource[] = ["intercom", "return_on"];
+const CONFIG_FILE = join(getAgentDir(), "pi-spend.json");
+
+const FOOTER_METRICS = [
+	{ id: "dialog", label: "Dialog usage", description: "Current dialog tokens and recorded cost." },
+	{ id: "agents", label: "Agent runs", description: "Subagent tokens, cost, and active run count." },
+	{ id: "forks", label: "Fork handlers", description: "Related intercom and return-on fork spend." },
+	{ id: "memory", label: "Memory context", description: "Visible and full observational-memory footprint." },
+	{ id: "lastMessage", label: "Last message time", description: "Local time of the latest user or assistant message." },
+] as const;
+
+type FooterMetric = (typeof FOOTER_METRICS)[number]["id"];
+type FooterMetricConfig = Record<FooterMetric, boolean>;
+
+const DEFAULT_FOOTER_METRICS: FooterMetricConfig = {
+	dialog: true,
+	agents: true,
+	forks: true,
+	memory: true,
+	lastMessage: true,
+};
 
 let latestCtx: ExtensionContext | undefined;
 let refreshTimer: NodeJS.Timeout | undefined;
+let footerMetrics: FooterMetricConfig = { ...DEFAULT_FOOTER_METRICS };
+let savedFooterMetrics: FooterMetricConfig = { ...DEFAULT_FOOTER_METRICS };
 let lastStatus: string | undefined;
+let lastMessageAt: number | undefined;
 let lastStatusAt = 0;
 let lastScopeKey: string | undefined;
 let allReportCache: { createdAt: number; report: string; forkSpendEnabled: boolean } | undefined;
@@ -53,6 +77,22 @@ type SessionScope = {
 
 function emptyTokens(): TokenUsage {
 	return { input: 0, output: 0, total: 0 };
+}
+
+function emptyAgentSpend(): AgentSpendSummary {
+	return { runs: [], active: [], steps: 0, totalTokens: emptyTokens() };
+}
+
+function emptyMemorySpend(): ObservationalMemorySpendSummary {
+	return {
+		visibleTokens: emptyTokens(),
+		fullTokens: emptyTokens(),
+		visibleObservations: 0,
+		visibleReflections: 0,
+		fullObservations: 0,
+		fullReflections: 0,
+		droppedObservations: 0,
+	};
 }
 
 function addTokenUsage(acc: TokenUsage, tokens: TokenUsage | undefined): void {
@@ -136,6 +176,48 @@ function currentBranchEntries(ctx: ExtensionContext | undefined): unknown[] {
 	}
 }
 
+function latestConversationMessageAt(entries: unknown[]): number | undefined {
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = recordValue(entries[index]);
+		if (entry?.type !== "message") continue;
+		const message = recordValue(entry.message);
+		if (message?.role !== "user" && message?.role !== "assistant") continue;
+		const timestamp = message.timestamp;
+		if (typeof timestamp === "number" && Number.isFinite(timestamp) && timestamp > 0) return timestamp;
+	}
+	return undefined;
+}
+
+function formatLastMessageTime(timestamp: number | undefined, now = Date.now()): string | undefined {
+	if (timestamp === undefined || !Number.isFinite(timestamp) || timestamp <= 0) return undefined;
+	const date = new Date(timestamp);
+	const current = new Date(now);
+	const pad = (value: number) => String(value).padStart(2, "0");
+	const time = `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+	const sameDay =
+		date.getFullYear() === current.getFullYear() &&
+		date.getMonth() === current.getMonth() &&
+		date.getDate() === current.getDate();
+	if (sameDay) return time;
+	const monthDay = `${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+	return date.getFullYear() === current.getFullYear() ? `${monthDay} ${time}` : `${date.getFullYear()}-${monthDay} ${time}`;
+}
+
+function combinedFooterStatus(now = Date.now()): string | undefined {
+	const parts: string[] = [];
+	if (lastStatus) parts.push(lastStatus);
+	if (footerMetrics.lastMessage) {
+		const messageTime = formatLastMessageTime(lastMessageAt, now);
+		if (messageTime) parts.push(`◷ last ${messageTime}`);
+	}
+	return parts.length > 0 ? parts.join(" · ") : undefined;
+}
+
+function renderFooterStatus(ctx = latestCtx, now = Date.now()): void {
+	if (!ctx?.hasUI) return;
+	ctx.ui.setStatus(STATUS_KEY, combinedFooterStatus(now));
+}
+
 function modelInputCostPerMillion(model: unknown): number | undefined {
 	const record = typeof model === "object" && model !== null ? model as Record<string, unknown> : undefined;
 	const cost = typeof record?.cost === "object" && record.cost !== null ? record.cost as Record<string, unknown> : undefined;
@@ -153,6 +235,38 @@ function modelDisplayName(model: unknown): string | undefined {
 
 function recordValue(value: unknown): Record<string, unknown> | undefined {
 	return typeof value === "object" && value !== null ? value as Record<string, unknown> : undefined;
+}
+
+function normalizeFooterMetrics(value: unknown): FooterMetricConfig {
+	const root = recordValue(value);
+	const metrics = recordValue(root?.metrics);
+	const normalized = { ...DEFAULT_FOOTER_METRICS };
+	for (const metric of FOOTER_METRICS) {
+		const configured = metrics?.[metric.id];
+		if (typeof configured === "boolean") normalized[metric.id] = configured;
+	}
+	return normalized;
+}
+
+function loadFooterMetrics(): FooterMetricConfig {
+	try {
+		return normalizeFooterMetrics(JSON.parse(readFileSync(CONFIG_FILE, "utf8")));
+	} catch {
+		return { ...DEFAULT_FOOTER_METRICS };
+	}
+}
+
+function saveFooterMetrics(metrics: FooterMetricConfig): void {
+	mkdirSync(getAgentDir(), { recursive: true });
+	writeFileSync(CONFIG_FILE, `${JSON.stringify({ metrics }, null, 2)}\n`, "utf8");
+}
+
+function hasPeriodicFooterMetrics(metrics = footerMetrics): boolean {
+	return metrics.dialog || metrics.agents || metrics.forks || metrics.memory;
+}
+
+function footerMetricsEqual(a: FooterMetricConfig, b: FooterMetricConfig): boolean {
+	return FOOTER_METRICS.every((metric) => a[metric.id] === b[metric.id]);
 }
 
 function readObservationalMemoryModelConfig(path: string): { provider: string; id: string } | undefined {
@@ -214,7 +328,6 @@ function nextTick(): Promise<void> {
 async function setBusyStatus(ctx: ExtensionContext | undefined, message: string): Promise<void> {
 	if (ctx?.hasUI) {
 		ctx.ui.setStatus(STATUS_KEY, orange(`⧗ ${message}`));
-		ctx.ui.requestRender?.();
 	}
 	await nextTick();
 }
@@ -336,18 +449,22 @@ function forkSpendEnabled(ctx?: ExtensionContext): boolean {
 	return isPiForksExtensionEnabledFromSettings({ cwd: ctx?.cwd });
 }
 
-function currentSpend(ctx?: ExtensionContext, scopeMode: "current" | "all" = "current"): SpendSnapshot {
+function currentSpend(
+	ctx?: ExtensionContext,
+	scopeMode: "current" | "all" = "current",
+	metrics: FooterMetricConfig = DEFAULT_FOOTER_METRICS,
+): SpendSnapshot {
 	const scope = sessionScope(ctx);
-	const rawMemorySpend = cachedMemorySpend(currentBranchEntries(ctx));
-	const memoryModel = resolveObservationalMemoryModel(ctx);
-	const forksEnabled = forkSpendEnabled(ctx);
+	const forksEnabled = metrics.forks && forkSpendEnabled(ctx);
+	const memoryModel = metrics.memory ? resolveObservationalMemoryModel(ctx) : undefined;
+	const rawMemorySpend = metrics.memory ? cachedMemorySpend(currentBranchEntries(ctx)) : emptyMemorySpend();
 	return {
-		threadTokens: scopeMode === "all" ? allDialogSpend() : parseSessionTokenFile(scope.parentSessionFile),
-		agentSpend: scopeMode === "all" ? scanAgentSpend() : scanAgentSpend(scope),
+		threadTokens: metrics.dialog ? (scopeMode === "all" ? allDialogSpend() : parseSessionTokenFile(scope.parentSessionFile)) : undefined,
+		agentSpend: metrics.agents ? (scopeMode === "all" ? scanAgentSpend() : scanAgentSpend(scope)) : emptyAgentSpend(),
 		forkSummary: forksEnabled ? (scopeMode === "all" ? allForkSummary() : relatedForkSummary(scope)) : emptyForkSummary(),
 		forkSpendEnabled: forksEnabled,
-		memorySpend: withMemoryInputCost(rawMemorySpend, memoryModel),
-		memoryPricingModel: modelInputCostPerMillion(memoryModel) ? modelDisplayName(memoryModel) : undefined,
+		memorySpend: metrics.memory ? withMemoryInputCost(rawMemorySpend, memoryModel) : rawMemorySpend,
+		memoryPricingModel: metrics.memory && modelInputCostPerMillion(memoryModel) ? modelDisplayName(memoryModel) : undefined,
 	};
 }
 
@@ -434,27 +551,43 @@ async function formatAllSpendReport(ctx: ExtensionContext, progress?: ProgressUp
 function updateSpendStatus(ctx = latestCtx, options: { force?: boolean; now?: number } = {}): void {
 	if (!ctx?.hasUI) return;
 	const now = options.now ?? Date.now();
+	if (!hasPeriodicFooterMetrics()) {
+		lastStatus = undefined;
+		lastStatusAt = now;
+		lastScopeKey = undefined;
+		renderFooterStatus(ctx, now);
+		return;
+	}
 	const scope = sessionScope(ctx);
 	const key = scopeKey(scope);
 	if (options.force || key !== lastScopeKey || now - lastStatusAt >= REFRESH_MS) {
-		lastStatus = buildSpendStatus(currentSpend(ctx));
+		lastStatus = buildSpendStatus(currentSpend(ctx, "current", footerMetrics));
 		lastStatusAt = now;
 		lastScopeKey = key;
 	}
-	ctx.ui.setStatus(STATUS_KEY, lastStatus);
-	ctx.ui.requestRender?.();
+	renderFooterStatus(ctx, now);
 }
 
 function startRefresh(): void {
-	if (refreshTimer) return;
+	if (refreshTimer || !hasPeriodicFooterMetrics()) return;
 	refreshTimer = setInterval(() => updateSpendStatus(), REFRESH_MS);
 	refreshTimer.unref?.();
 }
 
-function stopRefresh(ctx = latestCtx): void {
+function stopRefreshTimer(): void {
 	if (refreshTimer) clearInterval(refreshTimer);
 	refreshTimer = undefined;
+}
+
+function syncRefreshTimer(): void {
+	if (hasPeriodicFooterMetrics()) startRefresh();
+	else stopRefreshTimer();
+}
+
+function stopRefresh(ctx = latestCtx): void {
+	stopRefreshTimer();
 	lastStatus = undefined;
+	lastMessageAt = undefined;
 	lastStatusAt = 0;
 	lastScopeKey = undefined;
 	try {
@@ -466,16 +599,31 @@ function stopRefresh(ctx = latestCtx): void {
 
 export const __test = {
 	buildSpendStatus,
+	combinedFooterStatus,
+	footerMetricsEqual,
+	formatLastMessageTime,
 	formatSpendReport,
 	isPiForksExtensionEnabledFromSettings,
+	latestConversationMessageAt,
+	normalizeFooterMetrics,
 	readObservationalMemoryModelConfig,
 };
 
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		latestCtx = ctx;
+		savedFooterMetrics = loadFooterMetrics();
+		footerMetrics = { ...savedFooterMetrics };
+		lastMessageAt = latestConversationMessageAt(currentBranchEntries(ctx));
 		updateSpendStatus(ctx, { force: true });
-		startRefresh();
+		syncRefreshTimer();
+	});
+
+	pi.on("message_end", async (event, ctx) => {
+		if (event.message.role !== "user" && event.message.role !== "assistant") return;
+		latestCtx = ctx;
+		lastMessageAt = event.message.timestamp;
+		renderFooterStatus(ctx);
 	});
 
 	pi.on("turn_end", async (_event, ctx) => {
@@ -521,6 +669,84 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify(formatSpendReport(ctx), "info");
 		updateSpendStatus(ctx, { force: true });
 	};
+
+	pi.registerCommand("pi-cost-config", {
+		description: "Configure which pi-spend metrics appear in the footer.",
+		handler: async (_args, ctx) => {
+			const mode = (ctx as ExtensionContext & { mode?: string }).mode;
+			if (!ctx.hasUI || (mode !== undefined && mode !== "tui")) {
+				ctx.ui.notify("/pi-cost-config requires TUI mode", "error");
+				return;
+			}
+
+			await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
+				const items: SettingItem[] = FOOTER_METRICS.map((metric) => ({
+					id: metric.id,
+					label: metric.label,
+					description: metric.description,
+					currentValue: footerMetrics[metric.id] ? "on" : "off",
+					values: ["on", "off"],
+				}));
+
+				const container = new Container();
+				container.addChild({
+					render: (width: number) => {
+						const dirty = !footerMetricsEqual(footerMetrics, savedFooterMetrics);
+						const title = `Pi Cost Footer Metrics${dirty ? " *" : ""}`;
+						return [truncateToWidth(theme.fg("accent", theme.bold(title)), width), ""];
+					},
+					invalidate() {},
+				});
+
+				const settingsList = new SettingsList(
+					items,
+					Math.min(items.length + 2, 12),
+					getSettingsListTheme(),
+					(id, newValue) => {
+						const metric = FOOTER_METRICS.find((candidate) => candidate.id === id);
+						if (!metric) return;
+						footerMetrics = { ...footerMetrics, [metric.id]: newValue === "on" };
+						lastStatusAt = 0;
+						lastScopeKey = undefined;
+						updateSpendStatus(ctx, { force: true });
+						syncRefreshTimer();
+					},
+					() => done(undefined),
+				);
+				container.addChild(settingsList);
+				container.addChild({
+					render: (width: number) => {
+						const dirty = !footerMetricsEqual(footerMetrics, savedFooterMetrics);
+						const help = dirty
+							? "Current Pi changed · Ctrl+S save as default · Esc close"
+							: "Changes affect current Pi · Ctrl+S save as default · Esc close";
+						return ["", truncateToWidth(theme.fg("dim", help), width)];
+					},
+					invalidate() {},
+				});
+
+				return {
+					render: (width: number) => container.render(width),
+					invalidate: () => container.invalidate(),
+					handleInput: (input: string) => {
+						if (matchesKey(input, "ctrl+s")) {
+							try {
+								saveFooterMetrics(footerMetrics);
+								savedFooterMetrics = { ...footerMetrics };
+								ctx.ui.notify("Pi cost footer saved as the global default", "info");
+							} catch (error) {
+								ctx.ui.notify(`Could not save pi-spend config: ${error instanceof Error ? error.message : String(error)}`, "error");
+							}
+							tui.requestRender();
+							return;
+						}
+						settingsList.handleInput(input);
+						tui.requestRender();
+					},
+				};
+			});
+		},
+	});
 
 	pi.registerCommand("pi-spend", {
 		description: "Show token/cost split across dialog, agents, fork handlers, and observational memory. Use --all for all known spend.",
