@@ -54,6 +54,54 @@ test("pi-forks detection follows package settings, filters, and project override
 	assert.equal(__test.isPiForksExtensionEnabledFromSettings({ homeDir, cwd: repoDir, env: {} }), false);
 });
 
+test("idle status refreshes less often while active work retains live cadence", () => {
+	const idleSpend = {
+		threadTokens: undefined,
+		agentSpend: emptyAgentSpend(),
+		forkSpendEnabled: true,
+		forkSummary: {
+			runs: [],
+			running: [],
+			stale: [],
+			countsByStatus: { starting: 0, running: 0, complete: 0, failed: 0, stale: 0, unknown: 0 },
+			totalTokens: { input: 0, output: 0, total: 0 },
+			maxRunningDurationMs: 0,
+		},
+		memorySpend: emptyMemorySpend(),
+	};
+	const activeSpend = {
+		...idleSpend,
+		agentSpend: {
+			...emptyAgentSpend(),
+			active: [{ id: "active", active: true, steps: 0, tokens: { input: 0, output: 0, total: 0 } }],
+		},
+	};
+
+	assert.equal(__test.spendHasActiveWork(idleSpend), false);
+	assert.equal(__test.refreshDelayMs(false), 60_000);
+	assert.equal(__test.spendHasActiveWork(activeSpend), true);
+	assert.equal(__test.refreshDelayMs(true), 10_000);
+});
+
+test("unchanged footer status is not republished on every refresh", () => {
+	const published: Array<string | undefined> = [];
+	const ctx = {
+		hasUI: true,
+		ui: {
+			setStatus(_key: string, status: string | undefined) {
+				published.push(status);
+			},
+		},
+	};
+
+	__test.renderFooterStatus(ctx);
+	__test.renderFooterStatus(ctx);
+	assert.equal(published.length, 1);
+
+	__test.renderFooterStatus(ctx, Date.now(), true);
+	assert.equal(published.length, 2);
+});
+
 test("spend status does not show fork spend when fork spend is disabled", () => {
 	const status = __test.buildSpendStatus({
 		threadTokens: undefined,
