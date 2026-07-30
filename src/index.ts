@@ -22,7 +22,8 @@ import { cyan, formatSpend, formatTokens, green, orange, violet } from "./format
 import { isPiForksExtensionEnabledFromSettings } from "./pi-forks-detection.ts";
 
 const STATUS_KEY = "pi-spend";
-const REFRESH_MS = 10_000;
+const ACTIVE_REFRESH_MS = 10_000;
+const IDLE_REFRESH_MS = 60_000;
 const ALL_REPORT_CACHE_MS = 60_000;
 const FORK_SPEND_SOURCES: ForkSource[] = ["intercom", "return_on"];
 const CONFIG_FILE = join(getAgentDir(), "pi-spend.json");
@@ -54,6 +55,9 @@ let lastStatus: string | undefined;
 let lastMessageAt: number | undefined;
 let lastStatusAt = 0;
 let lastScopeKey: string | undefined;
+let lastSnapshotHasActiveWork = false;
+let lastPublishedStatus: string | undefined;
+let lastPublishedCtx: ExtensionContext | undefined;
 let allReportCache: { createdAt: number; report: string; forkSpendEnabled: boolean } | undefined;
 
 const modelConfigCache = new Map<string, { mtimeMs?: number; size?: number; value?: { provider: string; id: string } }>();
@@ -213,9 +217,13 @@ function combinedFooterStatus(now = Date.now()): string | undefined {
 	return parts.length > 0 ? parts.join(" · ") : undefined;
 }
 
-function renderFooterStatus(ctx = latestCtx, now = Date.now()): void {
+function renderFooterStatus(ctx = latestCtx, now = Date.now(), force = false): void {
 	if (!ctx?.hasUI) return;
-	ctx.ui.setStatus(STATUS_KEY, combinedFooterStatus(now));
+	const status = combinedFooterStatus(now);
+	if (!force && ctx === lastPublishedCtx && status === lastPublishedStatus) return;
+	ctx.ui.setStatus(STATUS_KEY, status);
+	lastPublishedCtx = ctx;
+	lastPublishedStatus = status;
 }
 
 function modelInputCostPerMillion(model: unknown): number | undefined {
@@ -468,6 +476,14 @@ function currentSpend(
 	};
 }
 
+function spendHasActiveWork(spend: SpendSnapshot): boolean {
+	return spend.agentSpend.active.length > 0 || spend.forkSummary.running.length > 0;
+}
+
+function refreshDelayMs(spendIsActive = lastSnapshotHasActiveWork): number {
+	return spendIsActive ? ACTIVE_REFRESH_MS : IDLE_REFRESH_MS;
+}
+
 function buildSpendStatus(spend: SpendSnapshot): string | undefined {
 	const parts: string[] = [];
 	const thread = formatSpend(spend.threadTokens);
@@ -548,40 +564,47 @@ async function formatAllSpendReport(ctx: ExtensionContext, progress?: ProgressUp
 	return report;
 }
 
-function updateSpendStatus(ctx = latestCtx, options: { force?: boolean; now?: number } = {}): void {
+function updateSpendStatus(ctx = latestCtx, options: { force?: boolean; forcePublish?: boolean; now?: number } = {}): void {
 	if (!ctx?.hasUI) return;
 	const now = options.now ?? Date.now();
 	if (!hasPeriodicFooterMetrics()) {
 		lastStatus = undefined;
 		lastStatusAt = now;
 		lastScopeKey = undefined;
-		renderFooterStatus(ctx, now);
+		lastSnapshotHasActiveWork = false;
+		renderFooterStatus(ctx, now, options.forcePublish);
 		return;
 	}
 	const scope = sessionScope(ctx);
 	const key = scopeKey(scope);
-	if (options.force || key !== lastScopeKey || now - lastStatusAt >= REFRESH_MS) {
-		lastStatus = buildSpendStatus(currentSpend(ctx, "current", footerMetrics));
+	if (options.force || key !== lastScopeKey || now - lastStatusAt >= refreshDelayMs()) {
+		const spend = currentSpend(ctx, "current", footerMetrics);
+		lastStatus = buildSpendStatus(spend);
+		lastSnapshotHasActiveWork = spendHasActiveWork(spend);
 		lastStatusAt = now;
 		lastScopeKey = key;
 	}
-	renderFooterStatus(ctx, now);
+	renderFooterStatus(ctx, now, options.forcePublish);
 }
 
 function startRefresh(): void {
 	if (refreshTimer || !hasPeriodicFooterMetrics()) return;
-	refreshTimer = setInterval(() => updateSpendStatus(), REFRESH_MS);
+	refreshTimer = setTimeout(() => {
+		refreshTimer = undefined;
+		updateSpendStatus();
+		startRefresh();
+	}, refreshDelayMs());
 	refreshTimer.unref?.();
 }
 
 function stopRefreshTimer(): void {
-	if (refreshTimer) clearInterval(refreshTimer);
+	if (refreshTimer) clearTimeout(refreshTimer);
 	refreshTimer = undefined;
 }
 
 function syncRefreshTimer(): void {
+	stopRefreshTimer();
 	if (hasPeriodicFooterMetrics()) startRefresh();
-	else stopRefreshTimer();
 }
 
 function stopRefresh(ctx = latestCtx): void {
@@ -590,6 +613,9 @@ function stopRefresh(ctx = latestCtx): void {
 	lastMessageAt = undefined;
 	lastStatusAt = 0;
 	lastScopeKey = undefined;
+	lastSnapshotHasActiveWork = false;
+	lastPublishedStatus = undefined;
+	lastPublishedCtx = undefined;
 	try {
 		ctx?.ui.setStatus(STATUS_KEY, undefined);
 	} catch {
@@ -607,6 +633,9 @@ export const __test = {
 	latestConversationMessageAt,
 	normalizeFooterMetrics,
 	readObservationalMemoryModelConfig,
+	refreshDelayMs,
+	renderFooterStatus,
+	spendHasActiveWork,
 };
 
 export default function (pi: ExtensionAPI) {
@@ -615,7 +644,7 @@ export default function (pi: ExtensionAPI) {
 		savedFooterMetrics = loadFooterMetrics();
 		footerMetrics = { ...savedFooterMetrics };
 		lastMessageAt = latestConversationMessageAt(currentBranchEntries(ctx));
-		updateSpendStatus(ctx, { force: true });
+		updateSpendStatus(ctx, { force: true, forcePublish: true });
 		syncRefreshTimer();
 	});
 
@@ -629,21 +658,25 @@ export default function (pi: ExtensionAPI) {
 	pi.on("turn_end", async (_event, ctx) => {
 		latestCtx = ctx;
 		updateSpendStatus(ctx, { force: true });
+		syncRefreshTimer();
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
 		latestCtx = ctx;
 		updateSpendStatus(ctx, { force: true });
+		syncRefreshTimer();
 	});
 
 	pi.on("model_select", async (_event, ctx) => {
 		latestCtx = ctx;
 		updateSpendStatus(ctx, { force: true });
+		syncRefreshTimer();
 	});
 
 	pi.on("session_compact", async (_event, ctx) => {
 		latestCtx = ctx;
 		updateSpendStatus(ctx, { force: true });
+		syncRefreshTimer();
 	});
 
 	pi.on("session_shutdown", async () => {
@@ -664,10 +697,12 @@ export default function (pi: ExtensionAPI) {
 			const report = await formatAllSpendReport(ctx, (message) => setBusyStatus(ctx, message));
 			ctx.ui.notify(report, "info");
 			updateSpendStatus(ctx, { force: true });
+			syncRefreshTimer();
 			return;
 		}
 		ctx.ui.notify(formatSpendReport(ctx), "info");
 		updateSpendStatus(ctx, { force: true });
+		syncRefreshTimer();
 	};
 
 	pi.registerCommand("pi-cost-config", {

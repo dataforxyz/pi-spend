@@ -337,7 +337,9 @@ export function parseSessionTokenFile(sessionFile: string | undefined, options: 
 	const cached = sessionTokenCache.get(cacheKey);
 	if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
 		cached.lastAccessedAt = Date.now();
-		if (persistCache) schedulePersistentSessionTokenCacheSave();
+		// Cache hits are already durable. Persist access-order changes only when another
+		// token update makes the cache dirty, rather than rewriting the shared cache on
+		// every periodic footer refresh in every Pi process.
 		return cloneTokens(cached.tokens);
 	}
 	let input = 0;
